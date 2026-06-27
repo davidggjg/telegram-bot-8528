@@ -112,37 +112,55 @@ async def fetch_message(chat_id: int, message_id: int) -> Message:
     raise HTTPException(status_code=429, detail="Rate limit")
 
 
+async def _latest_saved_id() -> int:
+    """ה-ID של ההודעה האחרונה ב-Saved Messages, או 0 אם ריק."""
+    async for m in user_client.get_chat_history(chat_id="me", limit=1):
+        return m.id
+    return 0
+
+
 async def copy_to_saved_messages(message: Message) -> Message:
     """
     מעביר את ההודעה ל-Saved Messages של היוזר-בוט.
 
-    Pyrogram יודע להחזיר None מ-copy_message כשהיעד הוא הצ'אט של עצמך,
-    כי טלגרם שולח UpdateShortSentMessage במקום UpdateNewMessage ו-Pyrogram
-    לא תמיד מצליח לבנות מזה אובייקט Message מלא. אם זה קורה, אנחנו שולפים
-    את ההודעה האחרונה ישירות מההיסטוריה של "me" כגיבוי.
+    Pyrogram ידוע כמחזיר None מ-copy_message/send_* כששולחים לעצמך
+    ("me"), כי בתרחיש הזה טלגרם מחזיר סט עדכונים (updates) שלא תמיד
+    תואם למה שPyrogram מצפה לו כדי לבנות אובייקט Message — והפונקציה
+    מחזירה None בלי לזרוק שגיאה.
+
+    לכן לא מסתמכים על הערך המוחזר: שומרים את ה-ID האחרון ב-Saved
+    Messages *לפני* הקופי, ואז ממתינים עד שמופיעה הודעה עם ID גבוה
+    יותר (לא מסננים לפי media, כי לפעמים יש פיגור קטן בפרסור השדות).
     """
+    baseline_id = await _latest_saved_id()
+    log.info("copy_to_saved_messages: baseline_id=%s", baseline_id)
+
     saved = await user_client.copy_message(
         chat_id="me",
         from_chat_id=message.chat.id,
         message_id=message.id,
     )
-
-    # אלבום (media_group) מחזיר רשימה ולא הודעה בודדת
     if isinstance(saved, list):
         saved = saved[-1] if saved else None
 
     if saved is not None:
+        log.info("copy_message returned directly: id=%s", saved.id)
         return saved
 
-    # גיבוי: שליפת ההודעה האחרונה מ-Saved Messages
-    for _ in range(6):
-        await asyncio.sleep(0.5)
-        async for m in user_client.get_chat_history(chat_id="me", limit=1):
-            if m and m.media:
+    log.warning("copy_message returned None — falling back to history polling")
+
+    # עד 12 שניות, פולינג מתגבר
+    deadline = asyncio.get_event_loop().time() + 12
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(1)
+        async for m in user_client.get_chat_history(chat_id="me", limit=3):
+            if m.id > baseline_id:
+                log.info("Found copied message via polling: id=%s media=%s", m.id, bool(m.media))
                 return m
 
     raise RuntimeError(
-        "ההודעה הועברה ל-Saved Messages אך לא הצלחתי לאתר אותה בחזרה. נסה לשלוח שוב."
+        "ההודעה הועברה ל-Saved Messages אך לא הצלחתי לאתר אותה בחזרה תוך 12 שניות. "
+        "נסה לשלוח שוב, ואם זה חוזר — שלח לי את הלוג מ-Render (Logs tab, שורה 'copy_to_saved_messages')."
     )
 
 
