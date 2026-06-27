@@ -1,10 +1,7 @@
 """
 Telegram Stream-on-Demand Server
-- Bot receives file, sends chat_id+message_id to User-bot via shared dict
-- User-bot streams directly from the original chat (no forwarding needed)
-- FastAPI with HTTP 206 Range support
-- Built-in keep-alive every 5 minutes
-- Web dashboard
+הפתרון: הבוט מעביר את הקובץ ל-Saved Messages של המשתמש (היוזר-בוט)
+ואז מזרים משם ישירות.
 """
 
 import os
@@ -21,11 +18,9 @@ from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 import uvicorn
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Environment Variables ─────────────────────────────────────────────────────
 API_ID         = int(os.environ["API_ID"])
 API_HASH       = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
@@ -35,7 +30,6 @@ BASE_URL       = os.environ.get("BASE_URL", f"http://localhost:{PORT}")
 
 CHUNK_SIZE = 1024 * 512  # 512 KB
 
-# ── Stats ─────────────────────────────────────────────────────────────────────
 stats = {
     "started_at": datetime.utcnow().isoformat(),
     "files_processed": 0,
@@ -44,7 +38,7 @@ stats = {
     "last_ping": None,
 }
 
-# ── Pyrogram User-bot ─────────────────────────────────────────────────────────
+# User-bot — מחובר לחשבון האישי שלך
 user_client = Client(
     name="stream_userbot",
     api_id=API_ID,
@@ -53,7 +47,7 @@ user_client = Client(
     in_memory=True,
 )
 
-# ── Pyrogram Bot ──────────────────────────────────────────────────────────────
+# Bot — הבוט שמקבל קבצים
 bot_client = Client(
     name="stream_bot",
     api_id=API_ID,
@@ -62,7 +56,6 @@ bot_client = Client(
     in_memory=True,
 )
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
 api = FastAPI(title="Telegram Stream Server")
 
 # ── Stream helpers ────────────────────────────────────────────────────────────
@@ -81,11 +74,12 @@ def parse_range(range_header: str, file_size: int) -> tuple[int, int]:
 async def fetch_message(chat_id: int, message_id: int) -> Message:
     for attempt in range(5):
         try:
-            return await user_client.get_messages(chat_id, message_id)
+            msg = await user_client.get_messages(chat_id, message_id)
+            return msg
         except FloodWait as e:
-            log.warning("FloodWait %ss (attempt %s)", e.value, attempt + 1)
+            log.warning("FloodWait %ss", e.value)
             await asyncio.sleep(e.value)
-    raise HTTPException(status_code=429, detail="Telegram rate limit")
+    raise HTTPException(status_code=429, detail="Rate limit")
 
 
 async def stream_chunks(
@@ -126,7 +120,7 @@ async def stream_chunks(
         if to_send is not None and sent >= to_send:
             break
 
-# ── Stream Route ──────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @api.get("/stream/{chat_id}/{message_id}")
 async def stream(chat_id: int, message_id: int, request: Request):
@@ -166,14 +160,12 @@ async def stream(chat_id: int, message_id: int, request: Request):
         status_code=200, media_type=mime_type, headers=headers,
     )
 
-# ── Ping ──────────────────────────────────────────────────────────────────────
 
 @api.get("/ping")
 async def ping():
     stats["last_ping"] = datetime.utcnow().isoformat()
     return JSONResponse({"status": "ok"})
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
 
 @api.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -222,8 +214,8 @@ async def dashboard():
     <h2>🎬 איך משתמשים?</h2>
     <div class="how">
       1. שלח לבוט קובץ וידאו / אודיו<br>
-      2. הבוט מחזיר קישור סטרימינג מיידי ✅<br>
-      3. הקישור עובד בכל נגן עם Seek מלא 🎬<br><br>
+      2. קבל קישור סטרימינג מיידי ✅<br>
+      3. עובד בכל נגן עם Seek מלא 🎬<br><br>
       <strong>פורמט URL:</strong><br>
       <code>{BASE_URL}/stream/CHAT_ID/MESSAGE_ID</code>
     </div>
@@ -237,30 +229,39 @@ async def dashboard():
 @bot_client.on_message(filters.private & (filters.video | filters.audio | filters.document | filters.video_note))
 async def handle_media(client, message: Message):
     stats["files_processed"] += 1
+    wait_msg = await message.reply_text("⏳ מעבד...")
 
-    media     = message.video or message.audio or message.document or message.video_note
-    file_name = getattr(media, "file_name", "קובץ")
-    file_size = getattr(media, "file_size", 0)
-    size_mb   = round(file_size / 1024 / 1024, 1)
+    try:
+        media     = message.video or message.audio or message.document or message.video_note
+        file_name = getattr(media, "file_name", "קובץ")
+        file_size = getattr(media, "file_size", 0)
+        size_mb   = round(file_size / 1024 / 1024, 1)
 
-    # הבוט רואה את ההודעה — chat_id ו-message_id שלה מספיקים
-    # היוזר-בוט יכול לגשת לאותה הודעה כי הוא אותו חשבון ששלח
-    chat_id    = message.chat.id
-    message_id = message.id
+        # היוזר-בוט שומר העתק ב-Saved Messages שלו
+        saved = await user_client.copy_message(
+            chat_id="me",
+            from_chat_id=message.chat.id,
+            message_id=message.id,
+        )
 
-    stream_url = f"{BASE_URL}/stream/{chat_id}/{message_id}"
-    stats["links_generated"] += 1
-    stats["last_file"] = f"{file_name} ({size_mb}MB)"
+        me = await user_client.get_me()
+        stream_url = f"{BASE_URL}/stream/{me.id}/{saved.id}"
 
-    await message.reply_text(
-        f"✅ **קישור סטרימינג מוכן!**\n\n"
-        f"📄 קובץ: `{file_name}`\n"
-        f"📦 גודל: {size_mb} MB\n\n"
-        f"🔗 **קישור:**\n`{stream_url}`\n\n"
-        f"_הקישור תומך ב-Seek מלא ועובד בכל נגן_ 🎬",
-        quote=True,
-    )
-    log.info("Stream link: %s", stream_url)
+        stats["links_generated"] += 1
+        stats["last_file"] = f"{file_name} ({size_mb}MB)"
+
+        await wait_msg.edit_text(
+            f"✅ **קישור סטרימינג מוכן!**\n\n"
+            f"📄 קובץ: `{file_name}`\n"
+            f"📦 גודל: {size_mb} MB\n\n"
+            f"🔗 **קישור:**\n`{stream_url}`\n\n"
+            f"_הקישור תומך ב-Seek מלא ועובד בכל נגן_ 🎬"
+        )
+        log.info("Stream link: %s", stream_url)
+
+    except Exception as e:
+        log.error("Error: %s", e)
+        await wait_msg.edit_text(f"❌ שגיאה: {str(e)}")
 
 
 @bot_client.on_message(filters.private & filters.command("start"))
@@ -279,7 +280,7 @@ async def keep_alive():
         try:
             async with httpx.AsyncClient() as c:
                 await c.get(f"{BASE_URL}/ping", timeout=10)
-                log.info("Keep-alive ping ✅")
+                log.info("Keep-alive ✅")
         except Exception as e:
             log.warning("Keep-alive failed: %s", e)
         await asyncio.sleep(300)
@@ -288,9 +289,7 @@ async def keep_alive():
 
 @api.on_event("startup")
 async def startup():
-    log.info("Starting User-bot...")
     await user_client.start()
-    log.info("Starting Bot...")
     await bot_client.start()
     asyncio.create_task(keep_alive())
     log.info("All systems ready ✅")
@@ -300,8 +299,6 @@ async def startup():
 async def shutdown():
     await user_client.stop()
     await bot_client.stop()
-
-# ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run("main:api", host="0.0.0.0", port=PORT, log_level="info")
