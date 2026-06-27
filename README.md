@@ -1,45 +1,38 @@
-# Telegram Stream Server — גרסה מתוקנת
+# Telegram Stream Server — גרסה מתוקנת (ארכיטקטורה מפושטת)
 
-## מה תוקן בגרסה הזו?
+## השינוי הגדול בגרסה הזו
 
-1. **Dockerfile היה מקבע פורט 8000** ומתעלם מ-`$PORT` שRender מזריק לקונטיינר.
-   תוקן ל-`CMD ["sh", "-c", "uvicorn main:api --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]`.
+**הוסר ה-userbot, ה-SESSION_STRING, וכל מנגנון ה-copy/forward ל-Saved Messages.**
 
-2. **BASE_URL** היה נופל ל-`http://localhost:8000` כברירת מחדל, מה שגרם
-   לקישורים שנשלחים למשתמשים להיות לא תקינים. כעת הקוד מגלה את הכתובת
-   האמיתית אוטומטית מ-`RENDER_EXTERNAL_URL` (משתנה שRender מגדיר לבד לכל
-   Web Service) — **אין צורך להגדיר את BASE_URL בעצמך ב-Render.**
+הבוט (`bot_client`) כבר מחובר ב-MTProto (לא Bot API HTTP) כי הוא משתמש
+ב-Pyrogram. ה-20MB הוא מגבלה של שכבת ה-HTTP בלבד (`api.telegram.org/bot.../getFile`)
+— Pyrogram מדבר ישירות עם שרתי MTProto של טלגרם ולא כפוף לה. אז אין שום
+צורך להעביר את הקובץ לחשבון נפרד — הבוט מזרים ישירות מההודעה המקורית
+שבה הוא קיבל את הקובץ (`message.chat.id` / `message.id`).
 
-3. **באג `'NoneType' object has no attribute 'id'`** — Pyrogram מחזיר
-   לפעמים `None` מ-`copy_message` כששולחים הודעה ל-Saved Messages של עצמך
-   (כי טלגרם מחזיר `UpdateShortSentMessage` במקום `UpdateNewMessage`).
-   נוספה פונקציית `copy_to_saved_messages` שמטפלת במקרה הזה ומשלימה
-   באמצעות שליפה ישירה מההיסטוריה.
+זה מבטל לגמרי:
+- את הבאג `'NoneType' object has no attribute 'id'`
+- את הצורך ב-SESSION_STRING וחשבון משתמש נפרד
+- את כל בעיות ה-timing/polling של Saved Messages
 
-4. **בדיקת משתני סביבה חסרים** — אם `API_ID` / `API_HASH` / `SESSION_STRING`
-   / `BOT_TOKEN` לא מוגדרים, השירות נכשל בעלייה עם הודעה ברורה בלוגים
-   במקום `KeyError` עמום.
+## מה עוד תוקן (מגרסאות קודמות)
 
-5. `get_me()` נטען פעם אחת בעלייה במקום בכל קובץ שמתקבל.
+1. **Dockerfile** מאזין ל-`$PORT` בפועל של Render, לא לפורט מקובע.
+2. **BASE_URL** מתגלה אוטומטית מ-`RENDER_EXTERNAL_URL`.
+3. בדיקת משתני סביבה חסרים עם הודעת שגיאה ברורה בעלייה.
 
 ## פריסה ל-Render
 
-### אופציה א׳ — Blueprint (מומלץ, חד-פעמי)
-1. דחוף את התיקייה הזו ל-GitHub repo
-2. ב-Render: **New → Blueprint** → חבר את ה-repo → Render יקרא את `render.yaml` אוטומטית
-3. תתבקש למלא 4 ערכים: `API_ID`, `API_HASH`, `SESSION_STRING`, `BOT_TOKEN`
+### Blueprint (מומלץ)
+1. דחוף את התיקייה ל-GitHub repo
+2. Render → **New → Blueprint** → חבר repo → ימולא אוטומטית מ-`render.yaml`
+3. תתבקש למלא 3 ערכים: `API_ID`, `API_HASH`, `BOT_TOKEN`
 4. Deploy
 
-### אופציה ב׳ — Web Service ידני
-1. **New → Web Service** → חבר repo
-2. Environment: **Docker** (יזהה את ה-Dockerfile אוטומטית)
-3. Environment Variables (Advanced):
-   - `API_ID`
-   - `API_HASH`
-   - `SESSION_STRING`
-   - `BOT_TOKEN`
-4. Health Check Path: `/ping`
-5. Create Web Service
+### Web Service ידני
+1. **New → Web Service** → חבר repo, Environment: **Docker**
+2. Environment Variables: `API_ID`, `API_HASH`, `BOT_TOKEN`
+3. Health Check Path: `/ping`
 
 ## משתני סביבה נדרשים
 
@@ -47,13 +40,15 @@
 |---|---|
 | `API_ID` | מ-https://my.telegram.org |
 | `API_HASH` | מ-https://my.telegram.org |
-| `SESSION_STRING` | session string של חשבון המשתמש (היוזר-בוט) |
 | `BOT_TOKEN` | טוקן הבוט מ-@BotFather |
-| `BASE_URL` | **אופציונלי** — רק אם רוצים לעקוף את הגילוי האוטומטי |
+| `BASE_URL` | **אופציונלי** — רק לעקיפת הגילוי האוטומטי |
+
+> שימי לב: `API_ID`/`API_HASH` כאן הם רק בשביל ש-Pyrogram יוכל להתחבר
+> כבוט דרך MTProto (חובה גם לבוטים, לא רק למשתמשים) — זה לא קשור לחשבון
+> משתמש אישי.
 
 ## הערה על Render Free tier
 
-בתוכנית החינמית השירות נכבה אחרי כ-15 דקות חוסר פעילות חיצונית, ועולה מחדש
-תוך 20-30 שניות בבקשה הראשונה (cold start). מנגנון ה-keep-alive בקוד שולח
-פינג כל 5 דקות כדי לצמצם את זה, אבל אם רוצים אפס השבתות — צריך לעבור
-לתוכנית בתשלום (Starter ומעלה).
+השירות נכבה אחרי כ-15 דקות חוסר פעילות חיצונית ועולה תוך 20-30 שניות
+בבקשה הראשונה. ה-keep-alive בקוד מקטין את הסיכוי לזה, אבל לאפס השבתות
+צריך תוכנית בתשלום (Starter ומעלה).

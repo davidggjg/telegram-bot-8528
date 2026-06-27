@@ -1,17 +1,18 @@
 """
 Telegram Stream-on-Demand Server
-הפתרון: הבוט מעביר את הקובץ ל-Saved Messages של המשתמש (היוזר-בוט)
-ואז מזרים משם ישירות.
+ארכיטקטורה מפושטת: בוט אחד, מחובר ב-MTProto (לא Bot API HTTP), שמזרים
+ישירות מהצ'אט המקורי שבו הוא קיבל את הקובץ. אין userbot, אין
+SESSION_STRING, אין copy/forward ל-Saved Messages.
 
-תיקונים בגרסה זו:
-1. BASE_URL מתגלה אוטומטית מ-RENDER_EXTERNAL_URL (Render מגדיר את זה לבד) –
-   אין יותר קישורים שמצביעים ל-localhost.
-2. תיקון לבאג "'NoneType' object has no attribute 'id'" – Pyrogram מחזיר
-   לפעמים None מ-copy_message כששולחים הודעה לעצמך (Saved Messages),
-   כי טלגרם מחזיר UpdateShortSentMessage במקום UpdateNewMessage. במקרה כזה
-   אנחנו שולפים את ההודעה האחרונה מההיסטוריה במקום לקרוס.
-3. בדיקת משתני סביבה חסרים עם הודעת שגיאה ברורה בעלייה, במקום KeyError גולמי.
-4. get_me() נטען פעם אחת בעלייה ולא בכל קובץ שמתקבל.
+למה זה עובד בלי מגבלת 20MB?
+ה-20MB הוא מגבלה של שכבת ה-HTTP Bot API (api.telegram.org/bot.../getFile)
+בלבד. Pyrogram מדבר ישירות עם שרתי MTProto של טלגרם — אותו פרוטוקול
+שאפליקציית טלגרם הרגילה משתמשת בו — ולכן לא כפוף למגבלה הזו. בוט
+שמחובר עם bot_token דרך Pyrogram יכול להוריד/להזרים קבצים גדולים בלי
+שום תחבולה.
+
+זה מבטל לגמרי את הבאג "'NoneType' object has no attribute 'id'" כי
+אין יותר שום קופי/פורוורד — המסר נשלף ישירות מהמיקום המקורי שלו.
 """
 
 import os
@@ -33,7 +34,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger(__name__)
 
 # ── בדיקת משתני סביבה ──────────────────────────────────────────────────────
-REQUIRED_ENV_VARS = ["API_ID", "API_HASH", "SESSION_STRING", "BOT_TOKEN"]
+# שימי לב: SESSION_STRING לא נדרש יותר! רק 3 ערכים.
+REQUIRED_ENV_VARS = ["API_ID", "API_HASH", "BOT_TOKEN"]
 _missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
 if _missing:
     sys.exit(
@@ -41,14 +43,12 @@ if _missing:
         f"   הגדר אותם ב-Render → Environment ונסה שוב."
     )
 
-API_ID         = int(os.environ["API_ID"])
-API_HASH       = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]
-BOT_TOKEN      = os.environ["BOT_TOKEN"]
-PORT           = int(os.environ.get("PORT", 8000))
+API_ID    = int(os.environ["API_ID"])
+API_HASH  = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+PORT      = int(os.environ.get("PORT", 8000))
 
 # Render מגדיר את זה אוטומטית לכתובת הציבורית האמיתית של השירות.
-# אם רץ במקום אחר (לוקאלית / שירות אחר) – אפשר עדיין לקבוע BASE_URL ידנית.
 BASE_URL = (
     os.environ.get("BASE_URL")
     or os.environ.get("RENDER_EXTERNAL_URL")
@@ -65,16 +65,7 @@ stats = {
     "last_ping": None,
 }
 
-# User-bot — מחובר לחשבון האישי שלך
-user_client = Client(
-    name="stream_userbot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-    in_memory=True,
-)
-
-# Bot — הבוט שמקבל קבצים
+# בוט אחד בלבד, מחובר ב-MTProto (לא Bot API HTTP) — גם מקבל הודעות וגם מזרים מהן.
 bot_client = Client(
     name="stream_bot",
     api_id=API_ID,
@@ -84,9 +75,6 @@ bot_client = Client(
 )
 
 api = FastAPI(title="Telegram Stream Server")
-
-# נטען פעם אחת בעלייה, כדי לא לפנות שוב ושוב ל-get_me()
-_self_id: Optional[int] = None
 
 # ── Stream helpers ────────────────────────────────────────────────────────────
 
@@ -104,64 +92,12 @@ def parse_range(range_header: str, file_size: int) -> tuple[int, int]:
 async def fetch_message(chat_id: int, message_id: int) -> Message:
     for attempt in range(5):
         try:
-            msg = await user_client.get_messages(chat_id, message_id)
+            msg = await bot_client.get_messages(chat_id, message_id)
             return msg
         except FloodWait as e:
             log.warning("FloodWait %ss", e.value)
             await asyncio.sleep(e.value)
     raise HTTPException(status_code=429, detail="Rate limit")
-
-
-async def _latest_saved_id() -> int:
-    """ה-ID של ההודעה האחרונה ב-Saved Messages, או 0 אם ריק."""
-    async for m in user_client.get_chat_history(chat_id="me", limit=1):
-        return m.id
-    return 0
-
-
-async def copy_to_saved_messages(message: Message) -> Message:
-    """
-    מעביר את ההודעה ל-Saved Messages של היוזר-בוט.
-
-    Pyrogram ידוע כמחזיר None מ-copy_message/send_* כששולחים לעצמך
-    ("me"), כי בתרחיש הזה טלגרם מחזיר סט עדכונים (updates) שלא תמיד
-    תואם למה שPyrogram מצפה לו כדי לבנות אובייקט Message — והפונקציה
-    מחזירה None בלי לזרוק שגיאה.
-
-    לכן לא מסתמכים על הערך המוחזר: שומרים את ה-ID האחרון ב-Saved
-    Messages *לפני* הקופי, ואז ממתינים עד שמופיעה הודעה עם ID גבוה
-    יותר (לא מסננים לפי media, כי לפעמים יש פיגור קטן בפרסור השדות).
-    """
-    baseline_id = await _latest_saved_id()
-    log.info("copy_to_saved_messages: baseline_id=%s", baseline_id)
-
-    saved = await user_client.copy_message(
-        chat_id="me",
-        from_chat_id=message.chat.id,
-        message_id=message.id,
-    )
-    if isinstance(saved, list):
-        saved = saved[-1] if saved else None
-
-    if saved is not None:
-        log.info("copy_message returned directly: id=%s", saved.id)
-        return saved
-
-    log.warning("copy_message returned None — falling back to history polling")
-
-    # עד 12 שניות, פולינג מתגבר
-    deadline = asyncio.get_event_loop().time() + 12
-    while asyncio.get_event_loop().time() < deadline:
-        await asyncio.sleep(1)
-        async for m in user_client.get_chat_history(chat_id="me", limit=3):
-            if m.id > baseline_id:
-                log.info("Found copied message via polling: id=%s media=%s", m.id, bool(m.media))
-                return m
-
-    raise RuntimeError(
-        "ההודעה הועברה ל-Saved Messages אך לא הצלחתי לאתר אותה בחזרה תוך 12 שניות. "
-        "נסה לשלוח שוב, ואם זה חוזר — שלח לי את הלוג מ-Render (Logs tab, שורה 'copy_to_saved_messages')."
-    )
 
 
 async def stream_chunks(
@@ -182,7 +118,7 @@ async def stream_chunks(
     to_send = (end - start + 1) if end is not None else None
     sent    = 0
 
-    async for chunk in user_client.stream_media(msg, chunk_size=CHUNK_SIZE):
+    async for chunk in bot_client.stream_media(msg, chunk_size=CHUNK_SIZE):
         if skip > 0:
             if skip >= len(chunk):
                 skip -= len(chunk)
@@ -280,7 +216,7 @@ async def dashboard():
 </head>
 <body>
   <h1>📡 Telegram Stream Server <span class="status-dot"></span></h1>
-  <p class="subtitle">User-bot streaming — עוקף מגבלת 20MB</p>
+  <p class="subtitle">MTProto streaming — בוט יחיד, בלי 20MB limit</p>
   <div class="grid">
     <div class="card"><div class="num">{stats['files_processed']}</div><div class="label">קבצים שהתקבלו</div></div>
     <div class="card"><div class="num">{stats['links_generated']}</div><div class="label">קישורים שנוצרו</div></div>
@@ -297,7 +233,7 @@ async def dashboard():
     <div class="how">
       1. שלח לבוט קובץ וידאו / אודיו<br>
       2. קבל קישור סטרימינג מיידי ✅<br>
-      3. עובד בכל נגן עם Seek מלא 🎬<br><br>
+      3. עובד בכל נגן עם Seek מלא, גם מעל 20MB 🎬<br><br>
       <strong>פורמט URL:</strong><br>
       <code>{BASE_URL}/stream/CHAT_ID/MESSAGE_ID</code>
     </div>
@@ -310,7 +246,6 @@ async def dashboard():
 
 @bot_client.on_message(filters.private & (filters.video | filters.audio | filters.document | filters.video_note))
 async def handle_media(client, message: Message):
-    global _self_id
     stats["files_processed"] += 1
     wait_msg = await message.reply_text("⏳ מעבד...")
 
@@ -320,14 +255,9 @@ async def handle_media(client, message: Message):
         file_size = getattr(media, "file_size", 0)
         size_mb   = round(file_size / 1024 / 1024, 1)
 
-        # היוזר-בוט שומר העתק ב-Saved Messages שלו (עם טיפול ב-None)
-        saved = await copy_to_saved_messages(message)
-
-        if _self_id is None:
-            me = await user_client.get_me()
-            _self_id = me.id
-
-        stream_url = f"{BASE_URL}/stream/{_self_id}/{saved.id}"
+        # אין יותר copy/forward — מזרימים ישירות מההודעה המקורית
+        # שבה הבוט עצמו קיבל את הקובץ (message.chat.id / message.id).
+        stream_url = f"{BASE_URL}/stream/{message.chat.id}/{message.id}"
 
         stats["links_generated"] += 1
         stats["last_file"] = f"{file_name} ({size_mb}MB)"
@@ -371,18 +301,13 @@ async def keep_alive():
 
 @api.on_event("startup")
 async def startup():
-    global _self_id
-    await user_client.start()
     await bot_client.start()
-    me = await user_client.get_me()
-    _self_id = me.id
     asyncio.create_task(keep_alive())
     log.info("All systems ready ✅ BASE_URL=%s", BASE_URL)
 
 
 @api.on_event("shutdown")
 async def shutdown():
-    await user_client.stop()
     await bot_client.stop()
 
 if __name__ == "__main__":

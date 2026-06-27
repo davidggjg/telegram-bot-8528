@@ -9,9 +9,7 @@ services:
         sync: false
       - key: API_HASH
         sync: false
-      - key: SESSION_STRING
-        sync: false
       - key: BOT_TOKEN
         sync: false
+      # SESSION_STRING לא נדרש יותר! הבוט מזרים ישירות ב-MTProto בלי userbot.
       # BASE_URL לא חובה — הקוד מגלה אותו אוטומטית מ-RENDER_EXTERNAL_URL.
-      # הגדר אותו ידנית רק אם אתה רוצה דומיין מותאם אישית.
