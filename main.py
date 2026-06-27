@@ -2,9 +2,20 @@
 Telegram Stream-on-Demand Server
 הפתרון: הבוט מעביר את הקובץ ל-Saved Messages של המשתמש (היוזר-בוט)
 ואז מזרים משם ישירות.
+
+תיקונים בגרסה זו:
+1. BASE_URL מתגלה אוטומטית מ-RENDER_EXTERNAL_URL (Render מגדיר את זה לבד) –
+   אין יותר קישורים שמצביעים ל-localhost.
+2. תיקון לבאג "'NoneType' object has no attribute 'id'" – Pyrogram מחזיר
+   לפעמים None מ-copy_message כששולחים הודעה לעצמך (Saved Messages),
+   כי טלגרם מחזיר UpdateShortSentMessage במקום UpdateNewMessage. במקרה כזה
+   אנחנו שולפים את ההודעה האחרונה מההיסטוריה במקום לקרוס.
+3. בדיקת משתני סביבה חסרים עם הודעת שגיאה ברורה בעלייה, במקום KeyError גולמי.
+4. get_me() נטען פעם אחת בעלייה ולא בכל קובץ שמתקבל.
 """
 
 import os
+import sys
 import asyncio
 import logging
 import httpx
@@ -21,12 +32,28 @@ import uvicorn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
+# ── בדיקת משתני סביבה ──────────────────────────────────────────────────────
+REQUIRED_ENV_VARS = ["API_ID", "API_HASH", "SESSION_STRING", "BOT_TOKEN"]
+_missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
+if _missing:
+    sys.exit(
+        f"❌ חסרים משתני סביבה: {', '.join(_missing)}\n"
+        f"   הגדר אותם ב-Render → Environment ונסה שוב."
+    )
+
 API_ID         = int(os.environ["API_ID"])
 API_HASH       = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
 PORT           = int(os.environ.get("PORT", 8000))
-BASE_URL       = os.environ.get("BASE_URL", f"http://localhost:{PORT}")
+
+# Render מגדיר את זה אוטומטית לכתובת הציבורית האמיתית של השירות.
+# אם רץ במקום אחר (לוקאלית / שירות אחר) – אפשר עדיין לקבוע BASE_URL ידנית.
+BASE_URL = (
+    os.environ.get("BASE_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or f"http://localhost:{PORT}"
+).rstrip("/")
 
 CHUNK_SIZE = 1024 * 512  # 512 KB
 
@@ -58,6 +85,9 @@ bot_client = Client(
 
 api = FastAPI(title="Telegram Stream Server")
 
+# נטען פעם אחת בעלייה, כדי לא לפנות שוב ושוב ל-get_me()
+_self_id: Optional[int] = None
+
 # ── Stream helpers ────────────────────────────────────────────────────────────
 
 def parse_range(range_header: str, file_size: int) -> tuple[int, int]:
@@ -80,6 +110,40 @@ async def fetch_message(chat_id: int, message_id: int) -> Message:
             log.warning("FloodWait %ss", e.value)
             await asyncio.sleep(e.value)
     raise HTTPException(status_code=429, detail="Rate limit")
+
+
+async def copy_to_saved_messages(message: Message) -> Message:
+    """
+    מעביר את ההודעה ל-Saved Messages של היוזר-בוט.
+
+    Pyrogram יודע להחזיר None מ-copy_message כשהיעד הוא הצ'אט של עצמך,
+    כי טלגרם שולח UpdateShortSentMessage במקום UpdateNewMessage ו-Pyrogram
+    לא תמיד מצליח לבנות מזה אובייקט Message מלא. אם זה קורה, אנחנו שולפים
+    את ההודעה האחרונה ישירות מההיסטוריה של "me" כגיבוי.
+    """
+    saved = await user_client.copy_message(
+        chat_id="me",
+        from_chat_id=message.chat.id,
+        message_id=message.id,
+    )
+
+    # אלבום (media_group) מחזיר רשימה ולא הודעה בודדת
+    if isinstance(saved, list):
+        saved = saved[-1] if saved else None
+
+    if saved is not None:
+        return saved
+
+    # גיבוי: שליפת ההודעה האחרונה מ-Saved Messages
+    for _ in range(6):
+        await asyncio.sleep(0.5)
+        async for m in user_client.get_chat_history(chat_id="me", limit=1):
+            if m and m.media:
+                return m
+
+    raise RuntimeError(
+        "ההודעה הועברה ל-Saved Messages אך לא הצלחתי לאתר אותה בחזרה. נסה לשלוח שוב."
+    )
 
 
 async def stream_chunks(
@@ -228,6 +292,7 @@ async def dashboard():
 
 @bot_client.on_message(filters.private & (filters.video | filters.audio | filters.document | filters.video_note))
 async def handle_media(client, message: Message):
+    global _self_id
     stats["files_processed"] += 1
     wait_msg = await message.reply_text("⏳ מעבד...")
 
@@ -237,15 +302,14 @@ async def handle_media(client, message: Message):
         file_size = getattr(media, "file_size", 0)
         size_mb   = round(file_size / 1024 / 1024, 1)
 
-        # היוזר-בוט שומר העתק ב-Saved Messages שלו
-        saved = await user_client.copy_message(
-            chat_id="me",
-            from_chat_id=message.chat.id,
-            message_id=message.id,
-        )
+        # היוזר-בוט שומר העתק ב-Saved Messages שלו (עם טיפול ב-None)
+        saved = await copy_to_saved_messages(message)
 
-        me = await user_client.get_me()
-        stream_url = f"{BASE_URL}/stream/{me.id}/{saved.id}"
+        if _self_id is None:
+            me = await user_client.get_me()
+            _self_id = me.id
+
+        stream_url = f"{BASE_URL}/stream/{_self_id}/{saved.id}"
 
         stats["links_generated"] += 1
         stats["last_file"] = f"{file_name} ({size_mb}MB)"
@@ -260,7 +324,7 @@ async def handle_media(client, message: Message):
         log.info("Stream link: %s", stream_url)
 
     except Exception as e:
-        log.error("Error: %s", e)
+        log.exception("Error handling media")
         await wait_msg.edit_text(f"❌ שגיאה: {str(e)}")
 
 
@@ -289,10 +353,13 @@ async def keep_alive():
 
 @api.on_event("startup")
 async def startup():
+    global _self_id
     await user_client.start()
     await bot_client.start()
+    me = await user_client.get_me()
+    _self_id = me.id
     asyncio.create_task(keep_alive())
-    log.info("All systems ready ✅")
+    log.info("All systems ready ✅ BASE_URL=%s", BASE_URL)
 
 
 @api.on_event("shutdown")
