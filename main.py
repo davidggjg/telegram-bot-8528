@@ -1,7 +1,7 @@
 """
 Telegram Stream-on-Demand Server
-- Pyrogram User-bot streams from "Saved Messages"
-- Bot receives files, forwards to Saved Messages, returns stream link
+- Bot receives file, sends chat_id+message_id to User-bot via shared dict
+- User-bot streams directly from the original chat (no forwarding needed)
 - FastAPI with HTTP 206 Range support
 - Built-in keep-alive every 5 minutes
 - Web dashboard
@@ -65,7 +65,7 @@ bot_client = Client(
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 api = FastAPI(title="Telegram Stream Server")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Stream helpers ────────────────────────────────────────────────────────────
 
 def parse_range(range_header: str, file_size: int) -> tuple[int, int]:
     try:
@@ -222,8 +222,8 @@ async def dashboard():
     <h2>🎬 איך משתמשים?</h2>
     <div class="how">
       1. שלח לבוט קובץ וידאו / אודיו<br>
-      2. הבוט מעביר אוטומטית ל-Saved Messages של היוזר-בוט<br>
-      3. מקבל קישור סטרימינג מיידי עם Seek מלא ✅<br><br>
+      2. הבוט מחזיר קישור סטרימינג מיידי ✅<br>
+      3. הקישור עובד בכל נגן עם Seek מלא 🎬<br><br>
       <strong>פורמט URL:</strong><br>
       <code>{BASE_URL}/stream/CHAT_ID/MESSAGE_ID</code>
     </div>
@@ -232,7 +232,7 @@ async def dashboard():
 </html>"""
     return HTMLResponse(content=html)
 
-# ── Bot handlers ──────────────────────────────────────────────────────────────
+# ── Bot handler ───────────────────────────────────────────────────────────────
 
 @bot_client.on_message(filters.private & (filters.video | filters.audio | filters.document | filters.video_note))
 async def handle_media(client, message: Message):
@@ -243,37 +243,24 @@ async def handle_media(client, message: Message):
     file_size = getattr(media, "file_size", 0)
     size_mb   = round(file_size / 1024 / 1024, 1)
 
-    # שלח הודעת המתנה
-    wait_msg = await message.reply_text("⏳ מעבד את הקובץ...")
+    # הבוט רואה את ההודעה — chat_id ו-message_id שלה מספיקים
+    # היוזר-בוט יכול לגשת לאותה הודעה כי הוא אותו חשבון ששלח
+    chat_id    = message.chat.id
+    message_id = message.id
 
-    try:
-        # העבר את הקובץ ל-Saved Messages של היוזר-בוט
-        forwarded = await user_client.forward_messages(
-            chat_id="me",
-            from_chat_id=message.chat.id,
-            message_ids=message.id,
-        )
+    stream_url = f"{BASE_URL}/stream/{chat_id}/{message_id}"
+    stats["links_generated"] += 1
+    stats["last_file"] = f"{file_name} ({size_mb}MB)"
 
-        # הקישור מבוסס על Saved Messages (chat_id = "me")
-        me = await user_client.get_me()
-        saved_chat_id = me.id
-        stream_url = f"{BASE_URL}/stream/{saved_chat_id}/{forwarded.id}"
-
-        stats["links_generated"] += 1
-        stats["last_file"] = f"{file_name} ({size_mb}MB)"
-
-        await wait_msg.edit_text(
-            f"✅ **קישור סטרימינג מוכן!**\n\n"
-            f"📄 קובץ: `{file_name}`\n"
-            f"📦 גודל: {size_mb} MB\n\n"
-            f"🔗 **קישור:**\n`{stream_url}`\n\n"
-            f"_הקישור תומך ב-Seek מלא ועובד בכל נגן_ 🎬"
-        )
-        log.info("Stream link generated: %s", stream_url)
-
-    except Exception as e:
-        log.error("Error forwarding: %s", e)
-        await wait_msg.edit_text(f"❌ שגיאה: {str(e)}")
+    await message.reply_text(
+        f"✅ **קישור סטרימינג מוכן!**\n\n"
+        f"📄 קובץ: `{file_name}`\n"
+        f"📦 גודל: {size_mb} MB\n\n"
+        f"🔗 **קישור:**\n`{stream_url}`\n\n"
+        f"_הקישור תומך ב-Seek מלא ועובד בכל נגן_ 🎬",
+        quote=True,
+    )
+    log.info("Stream link: %s", stream_url)
 
 
 @bot_client.on_message(filters.private & filters.command("start"))
@@ -290,9 +277,9 @@ async def keep_alive():
     await asyncio.sleep(30)
     while True:
         try:
-            async with httpx.AsyncClient() as client:
-                await client.get(f"{BASE_URL}/ping", timeout=10)
-                log.info("Keep-alive ping sent")
+            async with httpx.AsyncClient() as c:
+                await c.get(f"{BASE_URL}/ping", timeout=10)
+                log.info("Keep-alive ping ✅")
         except Exception as e:
             log.warning("Keep-alive failed: %s", e)
         await asyncio.sleep(300)
