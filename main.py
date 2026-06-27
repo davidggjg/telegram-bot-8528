@@ -55,8 +55,6 @@ BASE_URL = (
     or f"http://localhost:{PORT}"
 ).rstrip("/")
 
-CHUNK_SIZE = 1024 * 512  # 512 KB
-
 stats = {
     "started_at": datetime.utcnow().isoformat(),
     "files_processed": 0,
@@ -100,6 +98,9 @@ async def fetch_message(chat_id: int, message_id: int) -> Message:
     raise HTTPException(status_code=429, detail="Rate limit")
 
 
+PYROGRAM_CHUNK_SIZE = 1024 * 1024  # Pyrogram's chunk size is fixed at 1 MiB — not configurable
+
+
 async def stream_chunks(
     chat_id: int,
     message_id: int,
@@ -114,11 +115,23 @@ async def stream_chunks(
     if not media:
         raise HTTPException(status_code=415, detail="Unsupported media type")
 
-    skip    = start
+    # stream_media() אין לו chunk_size — הוא קבוע על 1MiB. כדי לדלג נכון
+    # (Range/Seek) משתמשים ב-offset (איזה chunk להתחיל ממנו, ביחידות של
+    # 1MiB) ו-limit (כמה chunks לשלוף). זה גם הרבה יותר יעיל: טלגרם
+    # מתחיל לשלוח מהמקום הנכון בקובץ, ולא צריך להוריד את כל מה שלפניו.
+    offset = start // PYROGRAM_CHUNK_SIZE
+    skip   = start % PYROGRAM_CHUNK_SIZE
+
+    if end is not None:
+        last_chunk = end // PYROGRAM_CHUNK_SIZE
+        limit = last_chunk - offset + 1
+    else:
+        limit = 0  # 0 = עד סוף הקובץ
+
     to_send = (end - start + 1) if end is not None else None
     sent    = 0
 
-    async for chunk in bot_client.stream_media(msg, chunk_size=CHUNK_SIZE):
+    async for chunk in bot_client.stream_media(msg, offset=offset, limit=limit):
         if skip > 0:
             if skip >= len(chunk):
                 skip -= len(chunk)
